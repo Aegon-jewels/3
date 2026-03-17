@@ -36,6 +36,10 @@
 
 • `{i}listapproved`
    List all approved PMs.
+
+• `{i}setpmlimit <number>`
+   Set how many messages before a user gets blocked (default: 2).
+   Each session stores its own limit separately.
 """
 
 import asyncio
@@ -86,8 +90,8 @@ if udB.get_key("PM_TEXT"):
         + udB.get_key("PM_TEXT")
         + "\n\nYou have {warn}/{twarn} warnings!"
     )
-# 1
-WARNS = udB.get_key("PMWARNS") or 4
+# Default limit is 2 (per-session, stored in DB as PMWARNS)
+WARNS = udB.get_key("PMWARNS") or 2
 PMCMDS = [
     f"{HNDLR}a",
     f"{HNDLR}approve",
@@ -119,6 +123,35 @@ async def delete_pm_warn_msgs(chat: int):
         await _to_delete[chat].delete()
     except KeyError:
         pass
+
+
+# =================================================================
+# Set PM Limit Command — per session, stored in DB
+
+@ultroid_cmd(pattern="setpmlimit( (.*)|$)", owner=True)
+async def set_pm_limit(event):
+    """Set the number of messages before auto-block. Stored per session."""
+    global WARNS
+    match = event.pattern_match.group(1).strip()
+    if not match:
+        current = udB.get_key("PMWARNS") or 2
+        return await event.eor(
+            f"`Current PM limit is` **{current}** `messages before block.`\n"
+            f"`Usage: {HNDLR}setpmlimit <number>`",
+            time=8,
+        )
+    if not match.isnumeric():
+        return await event.eor("`Please provide a valid number!`", time=5)
+    limit = int(match)
+    if limit < 1:
+        return await event.eor("`Limit must be at least 1.`", time=5)
+    udB.set_key("PMWARNS", limit)
+    WARNS = limit
+    await event.eor(
+        f"✅ **PM limit set to** `{limit}` **messages.**\n"
+        f"Users will be auto-blocked after sending `{limit}` unapproved PM(s).",
+        time=8,
+    )
 
 
 # =================================================================
@@ -560,7 +593,6 @@ async def unblockpm(event):
             for user in u_s.users:
                 await asyncio.sleep(1)
                 await event.client(UnblockRequest(user.id))
-            # GetBlockedRequest return 20 users at most.
             if count < 20:
                 return await eor(msg, f"__Unblocked {count} Users!__")
             while u_s.users:
@@ -860,7 +892,7 @@ async def _admin_tools(event):
 @callback(re.compile("don_(.*)"))
 async def _mejik(e):
     data = e.pattern_match.group(1).strip().decode("utf-8").split("/")
-    text = "👮‍♂ Warn Count : " + data[0]
+    text = "👮\u200d♂ Warn Count : " + data[0]
     text += "\n🤖 Total Warn Count : " + data[1]
     await e.answer(text, alert=True)
 

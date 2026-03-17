@@ -14,7 +14,7 @@
     To create Tiny stickers.
 
 • `{i}kang <reply to image/sticker>`
-    Kang the sticker (add to your pack).
+    Kang the sticker — shows all your packs as buttons to pick where to add it.
 
 • `{i}packkang <pack name>`
     Kang the Complete sticker set (with custom name).
@@ -66,6 +66,30 @@ from . import (
     types,
     udB,
 )
+
+# In-memory store for pending kangs: msg_id -> prepared kang data
+_KANG_PENDING = {}
+
+
+async def _get_user_packs(client, user_id):
+    """Fetch all sticker packs owned by user (ult_{user_id}_* pattern)."""
+    packs = []
+    pack_num = 1
+    while True:
+        for suffix in ["", "_anim", "_vid"]:
+            packname = f"ult_{user_id}_{pack_num}{suffix}"
+            try:
+                response = await async_searcher(f"http://t.me/addstickers/{packname}")
+                htmlstr = response.split("\n")
+                if "  A <strong>Telegram</strong> user has created the <strong>Sticker&nbsp;Set</strong>." in htmlstr:
+                    packs.append(packname)
+            except Exception:
+                pass
+        # Stop searching after hitting 10 pack numbers without results
+        if pack_num > 10:
+            break
+        pack_num += 1
+    return packs
 
 
 @ultroid_cmd(pattern="packkang")
@@ -198,184 +222,275 @@ async def hehe(args):
         photo = await quotly.create_quotly(message)
     else:
         return await xx.edit(get_string("com_4"))
+
+    if not emoji:
+        emoji = "🏵"
+
+    # --- Fetch existing packs for inline selection ---
+    await xx.edit("`Fetching your sticker packs...`")
+    packs = await _get_user_packs(ultroid_bot, user.id)
+
+    if not packs:
+        # No existing packs — auto-kang to pack 1 (create new)
+        await _do_kang(
+            args, xx, ultroid_bot, user, username,
+            photo, emoji, is_anim, is_vid,
+            packname=f"ult_{user.id}_1",
+            packnick=f"{username}'s Pack 1",
+        )
+        return
+
+    # Store kang data pending user pack selection
+    _KANG_PENDING[xx.id] = {
+        "args_chat": args.chat_id,
+        "args_reply": args.reply_to_msg_id,
+        "photo": photo,
+        "emoji": emoji,
+        "is_anim": is_anim,
+        "is_vid": is_vid,
+        "user_id": user.id,
+        "username": username,
+        "xx_id": xx.id,
+        "xx_chat": xx.chat_id,
+    }
+
+    # Build inline buttons — max 2 per row
+    buttons = []
+    row = []
+    for packname in packs:
+        label = packname.replace(f"ult_{user.id}_", "Pack ")
+        row.append(Button.inline(label, data=f"kang_pick_{xx.id}_{packname}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("❌ Cancel", data=f"kang_cancel_{xx.id}")])
+
+    await xx.edit(
+        "**🎴 Select a sticker pack to kang into:**",
+        buttons=buttons,
+    )
+
+
+async def _do_kang(
+    args, xx, ultroid_bot, user, username,
+    photo, emoji, is_anim, is_vid,
+    packname=None, packnick=None,
+):
+    """Core kang logic — adds sticker to given pack or creates a new one."""
+    if not packname:
+        packname = f"ult_{user.id}_1"
+    if not packnick:
+        packnick = f"{username}'s Pack 1"
+
+    cmd = "/newpack"
+    file = io.BytesIO()
+
+    if is_vid:
+        if "_vid" not in packname:
+            packname += "_vid"
+        packnick += " (Video)"
+        cmd = "/newvideo"
+    elif is_anim:
+        if "_anim" not in packname:
+            packname += "_anim"
+        packnick += " (Animated)"
+        cmd = "/newanimated"
+    else:
+        image = con.resize_photo_sticker(photo)
+        file.name = "sticker.png"
+        image.save(file, "PNG")
+
     if not udB.get_key("language") or udB.get_key("language") == "en":
         ra = random.choice(KANGING_STR)
     else:
         ra = get_string("sts_11")
     await xx.edit(f"`{ra}`")
-    if photo:
-        splat = args.text.split()
-        pack = 1
-        if not emoji:
-            emoji = "🏵"
-        if len(splat) == 3:
-            pack = splat[2]  # User sent ultroid_both
-            emoji = splat[1]
-        elif len(splat) == 2:
-            if splat[1].isnumeric():
-                pack = int(splat[1])
-            else:
-                emoji = splat[1]
 
-        packname = f"ult_{user.id}_{pack}"
-        packnick = f"{username}'s Pack {pack}"
-        cmd = "/newpack"
-        file = io.BytesIO()
+    response = await async_searcher(f"http://t.me/addstickers/{packname}")
+    htmlstr = response.split("\n")
 
-        if is_vid:
-            packname += "_vid"
-            packnick += " (Video)"
-            cmd = "/newvideo"
-        elif is_anim:
-            packname += "_anim"
-            packnick += " (Animated)"
-            cmd = "/newanimated"
-        else:
-            image = con.resize_photo_sticker(photo)
-            file.name = "sticker.png"
-            image.save(file, "PNG")
-
-        response = await async_searcher(f"http://t.me/addstickers/{packname}")
-        htmlstr = response.split("\n")
-
-        if (
-            "  A <strong>Telegram</strong> user has created the <strong>Sticker&nbsp;Set</strong>."
-            not in htmlstr
-        ):
-            async with ultroid_bot.conversation("@Stickers") as conv:
-                try:
-                    await conv.send_message("/addsticker")
-                except YouBlockedUserError:
-                    LOGS.info("Unblocking @Stickers for kang...")
-                    await ultroid_bot(functions.contacts.UnblockRequest("stickers"))
-                    await conv.send_message("/addsticker")
+    if (
+        "  A <strong>Telegram</strong> user has created the <strong>Sticker&nbsp;Set</strong>."
+        not in htmlstr
+    ):
+        async with ultroid_bot.conversation("@Stickers") as conv:
+            try:
+                await conv.send_message("/addsticker")
+            except YouBlockedUserError:
+                LOGS.info("Unblocking @Stickers for kang...")
+                await ultroid_bot(functions.contacts.UnblockRequest("stickers"))
+                await conv.send_message("/addsticker")
+            await conv.get_response()
+            await conv.send_message(packname)
+            x = await conv.get_response()
+            if x.text.startswith("Alright! Now send me the video sticker."):
+                await conv.send_file(photo, force_document=True)
+                x = await conv.get_response()
+            t = "50" if (is_anim or is_vid) else "120"
+            while t in x.message:
+                # Pack full — try next numbered pack of same type
+                base = packname.rstrip("0123456789")
+                num = int("".join(filter(str.isdigit, packname.split("_")[-1] or "1")) or 1) + 1
+                packname = f"ult_{user.id}_{num}"
+                packnick = f"{username}'s Pack {num}"
+                if is_anim:
+                    packname += "_anim"
+                    packnick += " (Animated)"
+                elif is_vid:
+                    packname += "_vid"
+                    packnick += " (Video)"
+                await xx.edit(get_string("sts_13").format(num))
+                await conv.send_message("/addsticker")
                 await conv.get_response()
                 await conv.send_message(packname)
                 x = await conv.get_response()
                 if x.text.startswith("Alright! Now send me the video sticker."):
                     await conv.send_file(photo, force_document=True)
                     x = await conv.get_response()
-                t = "50" if (is_anim or is_vid) else "120"
-                while t in x.message:
-                    pack += 1
-                    packname = f"ult_{user.id}_{pack}"
-                    packnick = f"{username}'s Pack {pack}"
+                if x.text in ["Invalid pack selected.", "Invalid set selected."]:
+                    await conv.send_message(cmd)
+                    await conv.get_response()
+                    await conv.send_message(packnick)
+                    await conv.get_response()
                     if is_anim:
-                        packname += "_anim"
-                        packnick += " (Animated)"
-                    elif is_vid:
-                        packnick += " (Video)"
-                        packname += "_vid"
-                    await xx.edit(get_string("sts_13").format(pack))
-                    await conv.send_message("/addsticker")
+                        await conv.send_file("AnimatedSticker.tgs")
+                        remove("AnimatedSticker.tgs")
+                    else:
+                        if is_vid:
+                            file = photo
+                        else:
+                            file.seek(0)
+                        await conv.send_file(file, force_document=True)
+                    await conv.get_response()
+                    await conv.send_message(emoji)
+                    await conv.get_response()
+                    await conv.send_message("/publish")
+                    if is_anim:
+                        await conv.get_response()
+                        await conv.send_message(f"<{packnick}>")
+                    await conv.get_response()
+                    await conv.send_message("/skip")
                     await conv.get_response()
                     await conv.send_message(packname)
-                    x = await conv.get_response()
-                    if x.text.startswith("Alright! Now send me the video sticker."):
-                        await conv.send_file(photo, force_document=True)
-                        x = await conv.get_response()
-                    if x.text in ["Invalid pack selected.", "Invalid set selected."]:
-                        await conv.send_message(cmd)
-                        await conv.get_response()
-                        await conv.send_message(packnick)
-                        await conv.get_response()
-                        if is_anim:
-                            await conv.send_file("AnimatedSticker.tgs")
-                            remove("AnimatedSticker.tgs")
-                        else:
-                            if is_vid:
-                                file = photo
-                            else:
-                                file.seek(0)
-                            await conv.send_file(file, force_document=True)
-                        await conv.get_response()
-                        await conv.send_message(emoji)
-                        await conv.get_response()
-                        await conv.send_message("/publish")
-                        if is_anim:
-                            await conv.get_response()
-                            await conv.send_message(f"<{packnick}>")
-                        await conv.get_response()
-                        await conv.send_message("/skip")
-                        await conv.get_response()
-                        await conv.send_message(packname)
-                        await conv.get_response()
-                        await xx.edit(
-                            get_string("sts_7").format(packname),
-                            parse_mode="md",
-                        )
-                        return
-                if is_anim:
-                    await conv.send_file("AnimatedSticker.tgs")
-                    remove("AnimatedSticker.tgs")
-                elif "send me an emoji" not in x.message:
-                    if is_vid:
-                        file = photo
-                    else:
-                        file.seek(0)
-                    await conv.send_file(file, force_document=True)
-                    rsp = await conv.get_response()
-                    if "Sorry, the file type is invalid." in rsp.text:
-                        await xx.edit(
-                            get_string("sts_8"),
-                        )
-                        return
-                await conv.send_message(emoji)
-                await conv.get_response()
-                await conv.send_message("/done")
-                await conv.get_response()
-                await ultroid_bot.send_read_acknowledge(conv.chat_id)
-        else:
-            await xx.edit("`Brewing a new Pack...`")
-            async with ultroid_bot.conversation("Stickers") as conv:
-                await conv.send_message(cmd)
-                await conv.get_response()
-                await conv.send_message(packnick)
-                await conv.get_response()
-                if is_anim:
-                    await conv.send_file("AnimatedSticker.tgs")
-                    remove("AnimatedSticker.tgs")
-                else:
-                    if is_vid:
-                        file = photo
-                    else:
-                        file.seek(0)
-                    await conv.send_file(file, force_document=True)
-                rsp = await conv.get_response()
-                if "Sorry, the file type is invalid." in rsp.text:
+                    await conv.get_response()
                     await xx.edit(
-                        get_string("sts_8"),
+                        get_string("sts_7").format(packname),
+                        parse_mode="md",
                     )
                     return
-                await conv.send_message(emoji)
+            if is_anim:
+                await conv.send_file("AnimatedSticker.tgs")
+                remove("AnimatedSticker.tgs")
+            elif "send me an emoji" not in x.message:
+                if is_vid:
+                    file = photo
+                else:
+                    file.seek(0)
+                await conv.send_file(file, force_document=True)
+                rsp = await conv.get_response()
+                if "Sorry, the file type is invalid." in rsp.text:
+                    await xx.edit(get_string("sts_8"))
+                    return
+            await conv.send_message(emoji)
+            await conv.get_response()
+            await conv.send_message("/done")
+            await conv.get_response()
+            await ultroid_bot.send_read_acknowledge(conv.chat_id)
+    else:
+        await xx.edit("`Brewing a new Pack...`")
+        async with ultroid_bot.conversation("Stickers") as conv:
+            await conv.send_message(cmd)
+            await conv.get_response()
+            await conv.send_message(packnick)
+            await conv.get_response()
+            if is_anim:
+                await conv.send_file("AnimatedSticker.tgs")
+                remove("AnimatedSticker.tgs")
+            else:
+                if is_vid:
+                    file = photo
+                else:
+                    file.seek(0)
+                await conv.send_file(file, force_document=True)
+            rsp = await conv.get_response()
+            if "Sorry, the file type is invalid." in rsp.text:
+                await xx.edit(get_string("sts_8"))
+                return
+            await conv.send_message(emoji)
+            await conv.get_response()
+            await conv.send_message("/publish")
+            if is_anim:
                 await conv.get_response()
-                await conv.send_message("/publish")
-                if is_anim:
-                    await conv.get_response()
-                    await conv.send_message(f"<{packnick}>")
+                await conv.send_message(f"<{packnick}>")
+            await conv.get_response()
+            await conv.send_message("/skip")
+            await conv.get_response()
+            await conv.send_message(packname)
+            await conv.get_response()
+            await ultroid_bot.send_read_acknowledge(conv.chat_id)
 
-                await conv.get_response()
-                await conv.send_message("/skip")
-                await conv.get_response()
-                await conv.send_message(packname)
-                await conv.get_response()
-                await ultroid_bot.send_read_acknowledge(conv.chat_id)
-        await xx.edit(
-            get_string("sts_12").format(emoji, packname),
-            parse_mode="md",
-        )
+    await xx.edit(
+        get_string("sts_12").format(emoji, packname),
+        parse_mode="md",
+    )
+    for fp in [photo, "AnimatedSticker.tgs", "ult.webp"]:
         try:
-            os.remove(photo)
-        except BaseException:
+            os.remove(fp)
+        except (BaseException, TypeError):
             pass
-        try:
-            os.remove("AnimatedSticker.tgs")
-        except BaseException:
-            pass
-        try:
-            os.remove("ult.webp")
-        except BaseException:
-            pass
+
+
+# ─── Callback: user picked a pack from inline buttons ───
+
+@callback(
+    re.compile(b"kang_pick_(.*)")
+)
+async def kang_pack_pick(event):
+    data = event.data_match.group(1).decode("utf-8")
+    # format: {xx_msg_id}_{packname}
+    parts = data.split("_", 1)
+    if len(parts) < 2:
+        return await event.answer("Invalid data.", alert=True)
+    xx_id = int(parts[0])
+    packname = parts[1]
+
+    pending = _KANG_PENDING.pop(xx_id, None)
+    if not pending:
+        return await event.edit("`Session expired. Please run .kang again.`")
+
+    user_id = pending["user_id"]
+    username = pending["username"]
+    num_part = packname.replace(f"ult_{user_id}_", "").replace("_anim", "").replace("_vid", "")
+    packnick = f"{username}'s Pack {num_part}"
+
+    await event.edit("`Kanging into ` **" + packname + "**`...`")
+
+    # Reconstruct xx as the edited message object
+    xx = event.message
+
+    await _do_kang(
+        event, xx,
+        event.client,
+        await event.client.get_entity(user_id),
+        username,
+        pending["photo"],
+        pending["emoji"],
+        pending["is_anim"],
+        pending["is_vid"],
+        packname=packname,
+        packnick=packnick,
+    )
+
+
+@callback(
+    re.compile(b"kang_cancel_(.*)")
+)
+async def kang_cancel(event):
+    xx_id = int(event.data_match.group(1).decode("utf-8"))
+    _KANG_PENDING.pop(xx_id, None)
+    await event.edit("`Kang cancelled.`")
 
 
 @ultroid_cmd(
